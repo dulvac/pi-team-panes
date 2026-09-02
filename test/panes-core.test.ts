@@ -7,6 +7,7 @@ import {
   herdrAgentStartArgs,
   herdrSplitArgs,
   isPreLaunchFailure,
+  isShellAtPrompt,
   it2SplitArgs,
   leaderPane,
   paneFirstPolicy,
@@ -139,6 +140,28 @@ test("policy text names the active backend", () => {
   for (const kind of ["herdr", "it2"] as const) {
     assert.match(paneFirstPolicy(kind), /pane_workers/);
   }
+});
+
+test("shell readiness: only a pane whose foreground is just its shell is startable", () => {
+  const info = (shellPid: number, fg: number[]) =>
+    JSON.stringify({
+      result: {
+        process_info: {
+          shell_pid: shellPid,
+          foreground_processes: fg.map((pid) => ({ pid, argv0: "zsh" })),
+        },
+      },
+    });
+
+  // At the prompt: foreground is the shell itself, or nothing.
+  assert.equal(isShellAtPrompt(info(100, [100])), true);
+  assert.equal(isShellAtPrompt(info(100, [])), true);
+  // Freshly split pane still running rc helpers, which is what agent start rejects.
+  assert.equal(isShellAtPrompt(info(100, [101, 100])), false);
+  // pi already running there.
+  assert.equal(isShellAtPrompt(info(100, [222])), false);
+  assert.equal(isShellAtPrompt("not json"), false);
+  assert.equal(isShellAtPrompt(JSON.stringify({ result: {} })), false);
 });
 
 test("worker names are sanitized", () => {

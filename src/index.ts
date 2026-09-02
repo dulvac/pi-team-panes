@@ -37,9 +37,11 @@ import {
   type BackendKind,
   herdrAgentStartArgs,
   herdrCloseArgs,
+  herdrProcessInfoArgs,
   herdrRunArgs,
   herdrSplitArgs,
   isPreLaunchFailure,
+  isShellAtPrompt,
   it2CloseArgs,
   it2RunArgs,
   it2SplitArgs,
@@ -152,6 +154,39 @@ function startTimeoutMs(): number {
   return Number.isFinite(raw) && raw > 0 ? raw : 90_000;
 }
 
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Wait until a freshly split pane is back at its interactive shell prompt.
+ * `herdr agent start` refuses a pane whose foreground still runs the shell's own
+ * startup helpers, and that refusal looks identical to a genuinely busy pane.
+ */
+async function waitForShellPrompt(pane: string, timeoutMs = 10_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      if (isShellAtPrompt(await run("herdr", herdrProcessInfoArgs(pane)))) return true;
+    } catch {
+      /* transient: the pane may not be queryable yet */
+    }
+    if (Date.now() >= deadline) return false;
+    await sleep(250);
+  }
+}
+
+/** Start pi as a named herdr agent, retrying once if the pane is still settling. */
+async function startHerdrAgent(name: string, pane: string): Promise<void> {
+  await waitForShellPrompt(pane);
+  const args = herdrAgentStartArgs({ name, pane, timeoutMs: startTimeoutMs() });
+  try {
+    await run("herdr", args);
+  } catch (err: any) {
+    if (!String(err?.message ?? err).includes("agent_pane_busy")) throw err;
+    await sleep(1_000);
+    await run("herdr", args);
+  }
+}
+
 async function spawnPaneWorker(
   name: string,
   teamId: string,
@@ -177,7 +212,7 @@ async function spawnPaneWorker(
   const paneId = parseHerdrPaneId(await run("herdr", herdrSplitArgs({ plan, cwd, env })));
   panes.set(name, { paneId, backend });
   try {
-    await run("herdr", herdrAgentStartArgs({ name, pane: paneId, timeoutMs: startTimeoutMs() }));
+    await startHerdrAgent(name, paneId);
     return { paneId };
   } catch (err: any) {
     const detail = String(err?.message ?? err);

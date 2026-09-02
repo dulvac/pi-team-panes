@@ -118,6 +118,32 @@ export function herdrRunArgs(pane: string, command: string): string[] {
   return ["pane", "run", pane, command];
 }
 
+export function herdrProcessInfoArgs(pane: string): string[] {
+  return ["pane", "process-info", "--pane", pane];
+}
+
+/**
+ * True when a pane sits at its interactive shell prompt, which is what
+ * `herdr agent start` requires. A freshly split pane briefly runs rc-file
+ * helpers (an extra `bash` in the foreground), and starting an agent then fails
+ * with agent_pane_busy.
+ */
+export function isShellAtPrompt(processInfoStdout: string): boolean {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(processInfoStdout);
+  } catch {
+    return false;
+  }
+  const info = (payload as {
+    result?: { process_info?: { shell_pid?: unknown; foreground_processes?: unknown } };
+  })?.result?.process_info;
+  const shellPid = info?.shell_pid;
+  if (typeof shellPid !== "number") return false;
+  const foreground = Array.isArray(info?.foreground_processes) ? info!.foreground_processes : [];
+  return (foreground as Array<{ pid?: unknown }>).every((proc) => proc?.pid === shellPid);
+}
+
 export function herdrCloseArgs(pane: string): string[] {
   return ["pane", "close", pane];
 }
