@@ -73,17 +73,198 @@ export interface SplitPlan {
   direction: Direction;
   /** it2 spelling of direction=right. */
   vertical: boolean;
+  /** Fraction of the source pane the source keeps (herdr only). */
+  ratio?: number;
+}
+
+export interface PaneRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface PaneGeometry {
+  paneId: string;
+  rect: PaneRect;
+}
+
+/** A worker column, top to bottom. Heights are rows for herdr, shares for it2. */
+export interface ColumnPane {
+  paneId: string;
+  height: number;
+}
+
+/** Panes of the tab holding `--pane`, as reported by `herdr pane layout`. */
+export function parseHerdrLayout(stdout: string): PaneGeometry[] {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(stdout);
+  } catch {
+    return [];
+  }
+  const panes = (payload as { result?: { layout?: { panes?: unknown } } })?.result?.layout?.panes;
+  if (!Array.isArray(panes)) return [];
+  const geometry: PaneGeometry[] = [];
+  for (const pane of panes as Array<{ pane_id?: unknown; rect?: Partial<PaneRect> }>) {
+    const { pane_id: paneId, rect } = pane;
+    if (typeof paneId !== "string" || !rect) continue;
+    const { x, y, width, height } = rect;
+    if ([x, y, width, height].some((v) => typeof v !== "number")) continue;
+    geometry.push({ paneId, rect: { x: x!, y: y!, width: width!, height: height! } });
+  }
+  return geometry;
+}
+
+/**
+ * The worker column as one contiguous vertical stack, or null when the panes no
+ * longer look like the layout this extension builds (worker panes in different
+ * columns, a gap, a pane moved or zoomed by hand). Untracked panes sharing the
+ * column are included, because resize amounts are fractions of the whole column
+ * and would be wrong if we pretended they weren't there.
+ */
+export function columnFromLayout(
+  panes: PaneGeometry[],
+  trackedIds: string[],
+): ColumnPane[] | null {
+  const tracked = panes.filter((pane) => trackedIds.includes(pane.paneId));
+  if (tracked.length === 0) return null;
+  const { x, width } = tracked[0]!.rect;
+  if (!tracked.every((pane) => pane.rect.x === x && pane.rect.width === width)) return null;
+
+  const column = panes
+    .filter((pane) => pane.rect.x === x && pane.rect.width === width)
+    .sort((a, b) => a.rect.y - b.rect.y);
+  for (let i = 1; i < column.length; i++) {
+    const above = column[i - 1]!.rect;
+    if (column[i]!.rect.y !== above.y + above.height) return null;
+  }
+  return column.map((pane) => ({ paneId: pane.paneId, height: pane.rect.height }));
+}
+
+/**
+ * Pane to carve the next worker out of.
+ *
+ * "bottom" keeps the split tree a right-leaning chain, which is what makes a
+ * resize amount predictable (the enclosing split of boundary i is then exactly
+ * panes i..n-1); the ratio below plus the equalize pass keep the column even.
+ * "tallest" is for backends that can neither size a split nor resize afterwards:
+ * spreading over the roomiest pane caps the imbalance at 2:1 instead of letting
+ * worker n collapse to a 1/2^n sliver.
+ */
+export function splitSource(
+  column: ColumnPane[],
+  mode: "bottom" | "tallest",
+): ColumnPane | undefined {
+  if (column.length === 0) return undefined;
+  if (mode === "bottom") return column[column.length - 1];
+  let best = column[0]!;
+  for (const pane of column) if (pane.height >= best.height) best = pane;
+  return best;
+}
+
+/**
+ * Fraction of the source pane the source keeps, so that a batch of `remaining`
+ * workers (including the one being created) ends up evenly sized.
+ *
+ * The new pane takes the space the workers after it still need, capped at a fair
+ * share of the source so an already tight column never starves the donor: for a
+ * fresh column this is exact (1/n each), and for a late arrival it takes one
+ * slot's worth out of the roomiest pane.
+ */
+export function evenSplitRatio(opts: {
+  sourceHeight: number;
+  columnHeight: number;
+  columnCount: number;
+  remaining: number;
+}): number {
+  const { sourceHeight, columnHeight, columnCount } = opts;
+  const remaining = Math.max(1, opts.remaining);
+  if (sourceHeight <= 0 || columnHeight <= 0 || columnCount <= 0) return 0.5;
+  const target = columnHeight / (columnCount + remaining);
+  const newHeight = Math.min(
+    remaining * target,
+    (sourceHeight * remaining) / (remaining + 1),
+  );
+  return clamp((sourceHeight - newHeight) / sourceHeight, 0.05, 0.95);
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+export interface ResizeOp {
+  paneId: string;
+  direction: "up" | "down";
+  /** Fraction of the enclosing split to move the boundary by. */
+  amount: number;
+}
+
+/**
+ * One boundary move that brings column pane `index` to its even height, or null
+ * when it is already there.
+ *
+ * Measured herdr semantics: `pane resize --pane P --direction down` moves the
+ * divider below P downwards (P grows, the panes below shrink), and `--direction
+ * up` moves the divider above P upwards (P grows, the pane above shrinks). Either
+ * way `amount` is a fraction of the split that owns that divider, which in a
+ * chain is the pane above the divider plus everything below it, and the far side
+ * is rescaled proportionally. So pane `index` is grown through itself and shrunk
+ * through its lower neighbour.
+ *
+ * Rows are integers and a column rarely divides evenly, so each pane aims at its
+ * share of the *cumulative* height rather than at total/n. That spreads the
+ * leftover rows one per pane instead of dumping the whole remainder on the last
+ * worker, and absorbs herdr's own rounding as the pass walks down.
+ */
+export function equalizeStep(column: ColumnPane[], index: number): ResizeOp | null {
+  if (index < 0 || index >= column.length - 1) return null;
+  const heights = column.map((pane) => pane.height);
+  const total = heights.reduce((a, b) => a + b, 0);
+  if (total <= 0) return null;
+  const container = heights.slice(index).reduce((a, b) => a + b, 0);
+  const above = heights.slice(0, index).reduce((a, b) => a + b, 0);
+  const target = Math.round(((index + 1) * total) / column.length) - above;
+  const diff = target - heights[index]!;
+  if (Math.abs(diff) < 1 || container <= 0) return null;
+  const amount = Number((Math.abs(diff) / container).toFixed(4));
+  if (amount <= 0) return null;
+  return diff > 0
+    ? { paneId: column[index]!.paneId, direction: "down", amount }
+    : { paneId: column[index + 1]!.paneId, direction: "up", amount };
 }
 
 /**
  * Column layout: the first worker splits the leader side by side, later workers
- * stack under the previous worker. Leader | [w1 / w2 / ...].
+ * carve space out of the column. Leader | [w1 / w2 / ...].
  */
-export function splitPlan(opts: { leader?: string; lastMember?: string }): SplitPlan {
-  if (opts.lastMember) {
-    return { source: opts.lastMember, direction: "down", vertical: false };
+export function splitPlan(opts: {
+  leader?: string;
+  /** Live worker column, top to bottom; empty on the first worker. */
+  column?: ColumnPane[];
+  /** Workers still to create in this batch, including this one. */
+  remaining?: number;
+  /** Backend can size a split and resize afterwards (herdr can, it2 cannot). */
+  withRatio?: boolean;
+}): SplitPlan {
+  const withRatio = opts.withRatio ?? true;
+  const column = opts.column ?? [];
+  const source = splitSource(column, withRatio ? "bottom" : "tallest");
+  if (!source) {
+    const plan: SplitPlan = { source: opts.leader, direction: "right", vertical: true };
+    if (withRatio) plan.ratio = 0.5;
+    return plan;
   }
-  return { source: opts.leader, direction: "right", vertical: true };
+  const plan: SplitPlan = { source: source.paneId, direction: "down", vertical: false };
+  if (withRatio) {
+    plan.ratio = evenSplitRatio({
+      sourceHeight: source.height,
+      columnHeight: column.reduce((a, pane) => a + pane.height, 0),
+      columnCount: column.length,
+      remaining: opts.remaining ?? 1,
+    });
+  }
+  return plan;
 }
 
 export function herdrSplitArgs(opts: {
@@ -94,11 +275,22 @@ export function herdrSplitArgs(opts: {
   const args = ["pane", "split"];
   if (opts.plan.source) args.push("--pane", opts.plan.source);
   else args.push("--current");
-  args.push("--direction", opts.plan.direction, "--no-focus", "--cwd", opts.cwd);
+  args.push("--direction", opts.plan.direction);
+  if (opts.plan.ratio !== undefined) args.push("--ratio", String(opts.plan.ratio));
+  args.push("--no-focus", "--cwd", opts.cwd);
   for (const [key, value] of Object.entries(opts.env ?? {})) {
     args.push("--env", `${key}=${value}`);
   }
   return args;
+}
+
+export function herdrResizeArgs(op: ResizeOp): string[] {
+  return ["pane", "resize", "--pane", op.paneId, "--direction", op.direction,
+    "--amount", String(op.amount)];
+}
+
+export function herdrLayoutArgs(pane?: string): string[] {
+  return pane ? ["pane", "layout", "--pane", pane] : ["pane", "layout", "--current"];
 }
 
 export function herdrAgentStartArgs(opts: {

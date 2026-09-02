@@ -12,7 +12,12 @@ Two pane backends, picked automatically:
   `herdr agent prompt`.
 - **it2** when pi runs inside iTerm2 with the [`it2`](https://github.com/mkusaka/it2) CLI on PATH.
 
-Layout is the same either way: leader on the left, workers stacked in a right-hand column.
+Layout is the same either way: leader on the left, workers stacked in a right-hand column, each one
+the same height. A single worker gets the full column; every later worker takes a fair share of it,
+whether the whole team is spawned at once or the workers trickle in one at a time. On herdr the split
+is sized up front (`pane split --ratio`) and the dividers are walked afterwards (`pane resize`) so the
+column stays even after every spawn and close. it2 can neither size a split nor resize one, so there
+each worker splits the roomiest pane, which keeps the column within a factor of two.
 
 ## Install
 
@@ -48,6 +53,7 @@ workers and you would end up with two agents wearing the same name.
 | `PI_PANES_BACKEND` | `herdr`, `it2`, or `auto` (default). Forces a backend. |
 | `PI_PANES_DEFAULT=0` | Skip the pane-first system prompt injection. |
 | `PI_PANES_START_TIMEOUT_MS` | Readiness timeout for `herdr agent start` (default 90000). |
+| `PI_PANES_EQUALIZE=0` | Leave pane sizes alone instead of evening out the column (herdr). |
 
 Worker environment (`PI_TEAMS_*`) mirrors what `/team env <name>` produces, so pane workers and
 RPC teammates share one task list and one team config.
@@ -71,8 +77,10 @@ npm test         # unit tests for backend selection, arg building, output parsin
 npm run typecheck
 ```
 
-`src/panes-core.ts` holds the pure logic (backend choice, layout, argument construction, parsing) and
-imports nothing from pi, which is what makes it testable on its own. `src/index.ts` is the pi glue:
+`src/panes-core.ts` holds the pure logic (backend choice, layout math, argument construction, parsing)
+and imports nothing from pi, which is what makes it testable on its own. The layout tests drive the
+planners through a model of herdr's split and resize behaviour, measured against a live herdr, so a
+regression in the sizing math fails in `npm test` rather than on screen. `src/index.ts` is the pi glue:
 command, tool, and the pane-first policy.
 
 ## License

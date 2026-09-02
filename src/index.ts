@@ -11,7 +11,9 @@
  *           named herdr agents, so herdr tracks their idle/working/blocked state.
  *  - it2    when running inside iTerm2 with the `it2` CLI on PATH.
  *
- * Layout in both cases: leader left, members stacked in a right-hand column.
+ * Layout in both cases: leader left, members stacked in an evenly sized right-hand
+ * column, whether the team is spawned in one call or trickles in one worker at a
+ * time.
  *
  * Commands:
  *  /panes sage grace     spawn two pane workers
@@ -24,6 +26,7 @@
  *  PI_PANES_BACKEND=herdr|it2|auto   force a backend (default auto)
  *  PI_PANES_DEFAULT=0                do not inject the pane-first system prompt
  *  PI_PANES_START_TIMEOUT_MS         readiness timeout for herdr agent start
+ *  PI_PANES_EQUALIZE=0               leave pane sizes alone (herdr)
  */
 import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -35,9 +38,14 @@ import * as fs from "node:fs";
 
 import {
   type BackendKind,
+  type ColumnPane,
+  columnFromLayout,
+  equalizeStep,
   herdrAgentStartArgs,
   herdrCloseArgs,
+  herdrLayoutArgs,
   herdrProcessInfoArgs,
+  herdrResizeArgs,
   herdrRunArgs,
   herdrSplitArgs,
   isPreLaunchFailure,
@@ -47,6 +55,7 @@ import {
   it2SplitArgs,
   leaderPane,
   paneFirstPolicy,
+  parseHerdrLayout,
   parseHerdrPaneId,
   parseIt2PaneId,
   pickBackend,
@@ -57,8 +66,12 @@ import {
 
 const execFileP = promisify(execFile);
 
-/** Panes spawned by this leader session: worker name -> { paneId, backend }. */
-const panes = new Map<string, { paneId: string; backend: BackendKind }>();
+/**
+ * Panes spawned by this leader session: worker name -> pane, backend, and a
+ * modelled height share (fraction of the column) used when the backend cannot
+ * report real geometry.
+ */
+const panes = new Map<string, { paneId: string; backend: BackendKind; share: number }>();
 
 const CLI: Record<BackendKind, string> = { herdr: "herdr", it2: "it2" };
 const INSTALL_HINT: Record<BackendKind, string> = {
@@ -157,6 +170,76 @@ function startTimeoutMs(): number {
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
+ * The worker column as it looks right now, top to bottom.
+ *
+ * herdr reports real pane rects, which also picks up panes the user resized,
+ * closed or added by hand. it2 exposes no usable geometry (its session list
+ * truncates ids), so there we fall back to the modelled shares, in spawn order:
+ * that backend only needs the heights, since it can neither size nor resize.
+ */
+async function workerColumn(backend: BackendKind, leader?: string): Promise<ColumnPane[]> {
+  const tracked = [...panes.values()].filter((entry) => entry.backend === backend);
+  if (tracked.length === 0) return [];
+  if (backend === "herdr") {
+    const live = await liveColumn(leader, tracked.map((entry) => entry.paneId));
+    if (live) return live;
+  }
+  return tracked.map((entry) => ({ paneId: entry.paneId, height: entry.share }));
+}
+
+async function liveColumn(
+  leader: string | undefined,
+  trackedIds: string[],
+): Promise<ColumnPane[] | null> {
+  try {
+    const layout = parseHerdrLayout(await run("herdr", herdrLayoutArgs(leader)));
+    return columnFromLayout(layout, trackedIds);
+  } catch {
+    return null; // layout unavailable: fall back to modelled shares
+  }
+}
+
+/** Keep the modelled shares in step with a split, and return the new pane's. */
+function trackShare(source: string | undefined, ratio: number, firstWorker: boolean): number {
+  if (firstWorker) return 1;
+  const donor = [...panes.values()].find((entry) => entry.paneId === source);
+  if (!donor) return 1;
+  const before = donor.share;
+  donor.share = before * ratio;
+  return before * (1 - ratio);
+}
+
+/**
+ * Even out the worker column: every worker gets the same height, and a lone
+ * worker gets the whole column.
+ *
+ * Split ratios alone cannot do it, because workers usually arrive one at a time
+ * and a split can only divide the pane it targets, so after each spawn or close
+ * the dividers get walked from the top. herdr rounds a move to whole rows, hence
+ * the re-measure between moves. Skipped when the column no longer looks like the
+ * layout this extension builds, or via PI_PANES_EQUALIZE=0.
+ */
+async function equalizeColumn(backend: BackendKind, leader?: string): Promise<void> {
+  if (backend !== "herdr" || process.env.PI_PANES_EQUALIZE === "0") return;
+  const trackedIds = [...panes.values()]
+    .filter((entry) => entry.backend === backend)
+    .map((entry) => entry.paneId);
+  if (trackedIds.length < 2) return;
+
+  let column = await liveColumn(leader, trackedIds);
+  for (let i = 0; column && i < column.length - 1; i++) {
+    const op = equalizeStep(column, i);
+    if (!op) continue;
+    try {
+      await run("herdr", herdrResizeArgs(op));
+    } catch {
+      return; // a stale pane id or a clamped boundary: leave the rest alone
+    }
+    column = await liveColumn(leader, trackedIds);
+  }
+}
+
+/**
  * Wait until a freshly split pane is back at its interactive shell prompt.
  * `herdr agent start` refuses a pane whose foreground still runs the shell's own
  * startup helpers, and that refusal looks identical to a genuinely busy pane.
@@ -191,26 +274,31 @@ async function spawnPaneWorker(
   name: string,
   teamId: string,
   cwd: string,
+  remaining = 1,
 ): Promise<{ paneId: string; note?: string }> {
   const existing = panes.get(name);
   if (existing) throw new Error(`Pane worker "${name}" already exists (${existing.paneId})`);
 
   const backend = activeBackend();
-  const lastMember = [...panes.values()].at(-1)?.paneId;
-  const plan = splitPlan({ leader: leaderPane(backend, process.env), lastMember });
+  const leader = leaderPane(backend, process.env);
+  const column = await workerColumn(backend, leader);
+  const plan = splitPlan({ leader, column, remaining, withRatio: backend === "herdr" });
+  const share = trackShare(plan.source, plan.ratio ?? 0.5, column.length === 0);
   const env = workerEnv(name, teamId);
 
   if (backend === "it2") {
     const paneId = parseIt2PaneId(await run("it2", it2SplitArgs(plan)));
     await run("it2", it2RunArgs(paneId, workerCommand({ cwd, env })));
-    panes.set(name, { paneId, backend });
+    panes.set(name, { paneId, backend, share });
     return { paneId };
   }
 
   // herdr: inject the worker env at pane creation, then let herdr launch and
   // name the agent so its lifecycle state shows up in the sidebar and CLI.
   const paneId = parseHerdrPaneId(await run("herdr", herdrSplitArgs({ plan, cwd, env })));
-  panes.set(name, { paneId, backend });
+  panes.set(name, { paneId, backend, share });
+  // Size the column before pi boots, so the worker starts at its final size.
+  await equalizeColumn(backend, leader);
   try {
     await startHerdrAgent(name, paneId);
     return { paneId };
@@ -237,6 +325,8 @@ async function closePaneWorker(name: string): Promise<void> {
     /* pane may already be closed by hand */
   });
   panes.delete(name);
+  // The closed pane's rows go to one neighbour; hand them round instead.
+  await equalizeColumn(entry.backend, leaderPane(entry.backend, process.env));
 }
 
 function listText(): string {
@@ -323,9 +413,14 @@ export default function (pi: ExtensionAPI) {
         const teamId = process.env.PI_TEAMS_TEAM_ID ?? ctx.sessionManager.getSessionId();
         const spawned: string[] = [];
         const notes: string[] = [];
-        for (const raw of rest) {
-          const name = sanitizeName(raw);
-          const { paneId, note } = await spawnPaneWorker(name, teamId, ctx.cwd);
+        const wanted = rest.map(sanitizeName);
+        for (const [index, name] of wanted.entries()) {
+          const { paneId, note } = await spawnPaneWorker(
+            name,
+            teamId,
+            ctx.cwd,
+            wanted.length - index,
+          );
           spawned.push(`${name} (pane ${paneId})`);
           if (note) notes.push(note);
         }
@@ -354,7 +449,7 @@ export default function (pi: ExtensionAPI) {
       "pane workers poll and auto-claim them; pass a task assignee only when a specific worker must " +
       "own it). 'list'/'close' manage panes. Workers self-register into the current team; use the " +
       "teams tool for messaging, status, task mutations, and team_done. Panes use a fixed layout: " +
-      "leader left, members stacked in a right-hand column.",
+      "leader left, members stacked in an evenly sized right-hand column.",
     parameters: PANE_WORKERS_PARAMS,
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const { action, names = [], tasks = [] } = params;
@@ -388,10 +483,16 @@ export default function (pi: ExtensionAPI) {
           details: {},
         };
       }
-      for (const raw of names) {
-        const name = sanitizeName(raw);
-        if (action === "delegate" && panes.has(name)) continue;
-        const { paneId, note } = await spawnPaneWorker(name, teamId, ctx.cwd);
+      const wanted = names
+        .map(sanitizeName)
+        .filter((name) => !(action === "delegate" && panes.has(name)));
+      for (const [index, name] of wanted.entries()) {
+        const { paneId, note } = await spawnPaneWorker(
+          name,
+          teamId,
+          ctx.cwd,
+          wanted.length - index,
+        );
         lines.push(`Spawned "${name}" in pane ${paneId} (team ${teamId}).`);
         if (note) lines.push(note);
       }
