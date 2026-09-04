@@ -26,7 +26,7 @@
  	}
 --- a/extensions/teams/teams-ui-shared.ts
 +++ b/extensions/teams/teams-ui-shared.ts
-@@ -83,18 +83,57 @@
+@@ -83,18 +83,75 @@
  		if (Number.isFinite(parsed) && parsed > 0) return parsed;
  	}
  	return 5 * 60 * 1000; // 5 minutes default
@@ -56,12 +56,30 @@
 +
 +export function getExternalActivity(name: string): ExternalActivity | undefined {
 +	return externalActivity.get(name);
- }
- 
++}
++
 +export function clearExternalActivity(name: string): void {
 +	externalActivity.delete(name);
 +}
 +
++/**
++ * Age of the last activity for a teammate, in ms, or null when unknown.
++ *
++ * Reads the RPC handle first, then an external report. Without this, a pane
++ * worker shows "last event: (unknown)" in member_status and the panel, which is
++ * exactly the field an operator checks to decide whether a quiet worker is
++ * thinking or wedged.
++ */
++export function resolveLastEventAge(
++	rpc: TeammateRpc | undefined,
++	cfg: TeamMember | undefined,
++): number | null {
++	if (rpc) return Date.now() - rpc.lastEventAt;
++	const external = cfg ? externalActivity.get(cfg.name) : undefined;
++	if (!external || external.lastEventAt <= 0) return null;
++	return Date.now() - external.lastEventAt;
+ }
+ 
  /**
   * Resolve the display status for a teammate, including stall detection.
   *
@@ -86,7 +104,7 @@
  
  	if (rpc.status === "streaming") {
  		const elapsed = Date.now() - rpc.lastEventAt;
-@@ -105,7 +144,12 @@
+@@ -105,7 +162,12 @@
  
  export function resolveStatus(rpc: TeammateRpc | undefined, cfg: TeamMember | undefined): TeammateStatus {
  	if (rpc) return rpc.status;
@@ -173,3 +191,61 @@
  	const spawnTeammate: SpawnTeammateFn = async (ctx, opts): Promise<SpawnTeammateResult> => {
  		const warnings: string[] = [];
  		const mode: ContextMode = opts.mode ?? "fresh";
+--- a/extensions/teams/leader-teams-tool.ts
++++ b/extensions/teams/leader-teams-tool.ts
+@@ -35,6 +35,7 @@
+ import type { ActivityTracker } from "./activity-tracker.js";
+ import {
+ 	resolveDisplayStatus,
++	resolveLastEventAge,
+ 	formatElapsed,
+ 	lastMessageSummary,
+ 	formatTokens,
+@@ -591,7 +592,8 @@
+ 						const displayStatus = resolveDisplayStatus(rpc, memberCfg);
+ 						const activity = tracker.get(n);
+ 						const elapsed = rpc ? formatElapsed(Date.now() - rpc.lastStatusChangeAt) : "";
+-						const noEventFor = rpc ? formatElapsed(Date.now() - rpc.lastEventAt) : "";
++						const lastEventAge = resolveLastEventAge(rpc, memberCfg);
++				const noEventFor = lastEventAge === null ? "" : formatElapsed(lastEventAge);
+ 						const currentTool = toolActivity(activity.currentToolName);
+ 						const msgPreview = lastMessageSummary(rpc, 80);
+ 						const model = memberCfg?.meta?.["model"];
+@@ -633,7 +635,8 @@
+ 				const tracker = getTracker();
+ 				const activity = tracker.get(name);
+ 				const elapsed = rpc ? formatElapsed(Date.now() - rpc.lastStatusChangeAt) : "";
+-				const noEventFor = rpc ? formatElapsed(Date.now() - rpc.lastEventAt) : "";
++				const memberLastEventAge = resolveLastEventAge(rpc, memberCfg);
++				const noEventFor = memberLastEventAge === null ? "" : formatElapsed(memberLastEventAge);
+ 				const currentTool = toolActivity(activity.currentToolName);
+ 				const msgPreview = lastMessageSummary(rpc, 120);
+ 				const allTasks = await listTasks(teamDir, effectiveTlId);
+--- a/extensions/teams/leader-info-commands.ts
++++ b/extensions/teams/leader-info-commands.ts
+@@ -5,7 +5,14 @@
+ import type { TeamConfig, TeamMember } from "./team-config.js";
+ import type { TeamsStyle } from "./teams-style.js";
+ import { formatMemberDisplayName, getTeamsStrings } from "./teams-style.js";
+-import { resolveDisplayStatus, formatElapsed, formatTokens, lastMessageSummary, toolActivity } from "./teams-ui-shared.js";
++import {
++	resolveDisplayStatus,
++	resolveLastEventAge,
++	formatElapsed,
++	formatTokens,
++	lastMessageSummary,
++	toolActivity,
++} from "./teams-ui-shared.js";
+ import type { ActivityTracker } from "./activity-tracker.js";
+ import { listTasks } from "./task-store.js";
+ 
+@@ -213,7 +220,8 @@
+ 	const displayStatus = resolveDisplayStatus(rpc, memberCfg);
+ 	const activity = tracker.get(name);
+ 	const elapsed = rpc ? formatElapsed(Date.now() - rpc.lastStatusChangeAt) : "";
+-	const noEventFor = rpc ? formatElapsed(Date.now() - rpc.lastEventAt) : "";
++	const lastEventAge = resolveLastEventAge(rpc, memberCfg);
++	const noEventFor = lastEventAge === null ? "" : formatElapsed(lastEventAge);
+ 	const currentTool = toolActivity(activity.currentToolName);
+ 	const msgPreview = lastMessageSummary(rpc, 120);
+ 	const allTasks = await listTasks(teamDir, effectiveTlId);

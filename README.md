@@ -104,8 +104,8 @@ knows a worker is thinking during a long pause where the transcript is silent. W
 backend), status is inferred: an unanswered tool call means working, otherwise transcript recency
 decides, and a worker whose transcript is still empty reads as `starting` rather than `idle`.
 
-The consumer half is three small edits to pi-agent-teams, kept in
-`upstream/pi-agent-teams-activity.patch` until they land upstream:
+The consumer half is five small edits to pi-agent-teams (verified against a pristine `0.5.5` tarball),
+kept in `upstream/pi-agent-teams-activity.patch` until they land upstream:
 
 ```bash
 cd ~/.pi/agent/npm/node_modules/@tmustier/pi-agent-teams
@@ -113,11 +113,16 @@ patch -p1 < ~/.pi/agent/git/github.com/dulvac/pi-team-panes/upstream/pi-agent-te
 ```
 
 It adds `ActivityTracker.applyExternal`, an external-activity registry consulted by
-`resolveDisplayStatus` and `resolveStatus`, and a `pi.events.on("teams:activity", ...)` subscription in
-the leader. A live RPC handle always wins over an external report, an offline member stays `stopped`,
-and a stale `streaming` report degrades to `stalled` on the existing threshold. Reapply the patch
-after updating pi-agent-teams; without it this package still works, the widget just keeps showing
-zeros.
+`resolveDisplayStatus` and `resolveStatus`, a `resolveLastEventAge` helper so `member_status` and
+`/team info` can report how long a pane worker has been quiet, and a
+`pi.events.on("teams:activity", ...)` subscription in the leader. A live RPC handle always wins over an
+external report, an offline member stays `stopped`, and a stale `streaming` report degrades to
+`stalled` on the existing threshold. Reapply the patch after updating pi-agent-teams; without it this
+package still works, the widget just keeps showing zeros.
+
+Measured on a live run: a pane worker went `starting` to `streaming` with its current tool named,
+counters climbing 5 to 8 tool calls and 225k to 403k tokens, back to `idle` between turns, then
+`stopped` with counters cleared when the pane closed.
 
 ## License
 
