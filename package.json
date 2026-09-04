@@ -32,7 +32,7 @@
     "typescript": "^7.0.2"
   },
   "scripts": {
-    "test": "node --test test/panes-core.test.ts",
+    "test": "node --test test/panes-core.test.ts test/worker-activity.test.ts",
     "typecheck": "node node_modules/typescript/lib/tsc.js --noEmit"
   }
 }
