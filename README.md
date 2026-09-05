@@ -105,7 +105,8 @@ backend), status is inferred: an unanswered tool call means working, otherwise t
 decides, and a worker whose transcript is still empty reads as `starting` rather than `idle`.
 
 The consumer half is five small edits to pi-agent-teams (verified against a pristine `0.5.5` tarball),
-kept in `upstream/pi-agent-teams-activity.patch` until they land upstream:
+open upstream as [tmustier/pi-agent-teams#49](https://github.com/tmustier/pi-agent-teams/pull/49) and
+kept here in `upstream/pi-agent-teams-activity.patch` until it lands:
 
 ```bash
 cd ~/.pi/agent/npm/node_modules/@tmustier/pi-agent-teams

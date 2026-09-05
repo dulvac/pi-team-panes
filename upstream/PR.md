@@ -1,5 +1,7 @@
 # Report activity for teammates the leader did not spawn
 
+Opened upstream as https://github.com/tmustier/pi-agent-teams/pull/49 (branch `dulvac:feat/external-teammate-activity`).
+
 ## The problem
 
 The widget, the interactive panel and `member_status` all derive a teammate's
