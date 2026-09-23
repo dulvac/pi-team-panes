@@ -43,7 +43,9 @@ export function pickBackend(env: Env): BackendChoice {
 
 export function sanitizeName(raw: string): string {
   const name = raw.trim().toLowerCase().replace(/[^a-z0-9_-]/g, "");
-  if (!name) throw new Error(`Invalid worker name: "${raw}"`);
+  // Names end up as positional arguments (`herdr agent start <name>`), where a
+  // leading hyphen would be read as an option instead.
+  if (!name || name.startsWith("-")) throw new Error(`Invalid worker name: "${raw}"`);
   return name;
 }
 
@@ -106,9 +108,10 @@ export function parseHerdrLayout(stdout: string): PaneGeometry[] {
   const panes = (payload as { result?: { layout?: { panes?: unknown } } })?.result?.layout?.panes;
   if (!Array.isArray(panes)) return [];
   const geometry: PaneGeometry[] = [];
-  for (const pane of panes as Array<{ pane_id?: unknown; rect?: Partial<PaneRect> }>) {
+  for (const pane of panes as Array<{ pane_id?: unknown; rect?: Partial<PaneRect> } | null>) {
+    if (!pane || typeof pane !== "object") continue;
     const { pane_id: paneId, rect } = pane;
-    if (typeof paneId !== "string" || !rect) continue;
+    if (typeof paneId !== "string" || !rect || typeof rect !== "object") continue;
     const { x, y, width, height } = rect;
     if ([x, y, width, height].some((v) => typeof v !== "number")) continue;
     geometry.push({ paneId, rect: { x: x!, y: y!, width: width!, height: height! } });
@@ -119,9 +122,16 @@ export function parseHerdrLayout(stdout: string): PaneGeometry[] {
 /**
  * The worker column as one contiguous vertical stack, or null when the panes no
  * longer look like the layout this extension builds (worker panes in different
- * columns, a gap, a pane moved or zoomed by hand). Untracked panes sharing the
- * column are included, because resize amounts are fractions of the whole column
- * and would be wrong if we pretended they weren't there.
+ * columns, a gap, a pane moved or zoomed by hand, a pane this extension does not
+ * own sharing the column).
+ *
+ * The untracked case is the subtle one. Resize amounts are fractions of the
+ * split that owns a divider, which is only predictable while the column is the
+ * right-leaning chain the spawn path builds. Rectangles say where panes sit on
+ * screen, not how the split tree nests, so a pane we did not create could be
+ * nested in a way that makes those fractions address the wrong boundary. Refuse
+ * the column instead of guessing, and let the caller fall back to its own
+ * tracked shares.
  */
 export function columnFromLayout(
   panes: PaneGeometry[],
@@ -135,6 +145,7 @@ export function columnFromLayout(
   const column = panes
     .filter((pane) => pane.rect.x === x && pane.rect.width === width)
     .sort((a, b) => a.rect.y - b.rect.y);
+  if (column.length !== tracked.length) return null;
   for (let i = 1; i < column.length; i++) {
     const above = column[i - 1]!.rect;
     if (column[i]!.rect.y !== above.y + above.height) return null;
@@ -319,6 +330,10 @@ export function herdrProcessInfoArgs(pane: string): string[] {
  * `herdr agent start` requires. A freshly split pane briefly runs rc-file
  * helpers (an extra `bash` in the foreground), and starting an agent then fails
  * with agent_pane_busy.
+ *
+ * Readiness has to be readable from the response: a payload without a shell pid
+ * or without a foreground list is reported as not-ready, so the caller polls
+ * again rather than starting an agent against a pane it cannot see into.
  */
 export function isShellAtPrompt(processInfoStdout: string): boolean {
   let payload: unknown;
@@ -332,8 +347,9 @@ export function isShellAtPrompt(processInfoStdout: string): boolean {
   })?.result?.process_info;
   const shellPid = info?.shell_pid;
   if (typeof shellPid !== "number") return false;
-  const foreground = Array.isArray(info?.foreground_processes) ? info!.foreground_processes : [];
-  return (foreground as Array<{ pid?: unknown }>).every((proc) => proc?.pid === shellPid);
+  const foreground = info?.foreground_processes;
+  if (!Array.isArray(foreground)) return false;
+  return (foreground as Array<{ pid?: unknown } | null>).every((proc) => proc?.pid === shellPid);
 }
 
 export function herdrCloseArgs(pane: string): string[] {
@@ -386,14 +402,14 @@ export function workerCommand(opts: { cwd: string; env: Record<string, string> }
 
 /**
  * True when `herdr agent start` failed before launching anything, so retrying
- * with a plain `pane run` is safe. Timeouts and detection failures are excluded:
- * pi may be booting in that pane, and typing a command into it would land in the
- * agent's prompt.
+ * with a plain `pane run` is safe. Timeouts, detection failures and a busy pane
+ * are excluded: in all three something may already own the pane's foreground
+ * (pi booting, a racing start, a leftover process), and typing a command there
+ * would land in that program's input rather than at a shell prompt.
  */
 export function isPreLaunchFailure(stderr: string): boolean {
   return [
     "agent_pane_not_found",
-    "agent_pane_busy",
     "agent_name_taken",
     "unsupported interactive agent kind",
     "invalid_agent_argument",

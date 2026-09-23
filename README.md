@@ -43,6 +43,7 @@ The model drives the same machinery through the `pane_workers` tool (`spawn`, `d
 unassigned by default so idle workers claim them themselves.
 
 Everything else stays on the `teams` tool: messaging, `member_status`, task mutations, `team_done`.
+Pane-management commands and tools are leader-only; workers should request more teammates from the leader.
 Do not pass pane-worker names to `teams delegate` or `member_spawn`, since those spawn headless RPC
 workers and you would end up with two agents wearing the same name.
 
@@ -55,16 +56,46 @@ workers and you would end up with two agents wearing the same name.
 | `PI_PANES_START_TIMEOUT_MS` | Readiness timeout for `herdr agent start` (default 90000). |
 | `PI_PANES_EQUALIZE=0` | Leave pane sizes alone instead of evening out the column (herdr). |
 
-Worker environment (`PI_TEAMS_*`) mirrors what `/team env <name>` produces, so pane workers and
-RPC teammates share one task list and one team config.
+Worker environment (`PI_TEAMS_*`) uses the active team's IDs and style, so pane workers and
+RPC teammates share one task list and one team config. Assigned tasks receive a mailbox notification;
+unassigned tasks are claimed by idle workers. Existing workers keep their startup task list: close and
+respawn them after `/team task use` or `/team attach` before delegating more work to them.
+
+### Live team state bridge
+
+The current pi-agent-teams release keeps the active team and task-list IDs in memory without exposing
+an API. Its config file can be stale after `/team task use`. This package therefore requires a small
+local bridge rather than guessing which task list to use.
+
+Install it explicitly, using the directory where your pi-agent-teams package is installed:
+
+```bash
+node scripts/teams-bridge.ts install ~/.pi/agent/npm/node_modules/@tmustier/pi-agent-teams
+```
+
+Then run `/reload` in pi. Git, project-local, and local-path installs work too: pass their package
+root instead. The script changes only `extensions/teams/leader.ts`, adding an in-process state
+request handler and a shutdown cleanup handler. It makes no network requests and is not run
+automatically. Installation is idempotent and refuses an edited bridge or unsupported source layout.
+A pi-agent-teams update may remove it; rerun the installer after updating.
+
+To remove it without discarding other edits:
+
+```bash
+node scripts/teams-bridge.ts remove ~/.pi/agent/npm/node_modules/@tmustier/pi-agent-teams
+```
+
+Reload again after removal. Without the bridge, listing and closing tracked panes still work;
+spawning and delegation fail before creating panes or tasks. The tool locates task-store and mailbox
+modules from the loaded extension's source metadata, not a hardcoded global npm directory.
 
 ## Notes on the herdr backend
 
 Worker env is injected at pane creation (`herdr pane split --env`), so `herdr agent start` inherits
 it without a shell prefix. If herdr cannot confirm readiness in time, the pane is left alone and the
 tool says so: pi may still be booting there, and sending a command into a booting agent would type
-into its prompt. Only failures that happen *before* launch (`agent_pane_busy`,
-`agent_pane_not_found`, `agent_name_taken`) fall back to a plain `herdr pane run`.
+into its prompt. Busy panes never receive a raw command. Pre-launch failures such as
+`agent_name_taken` may fall back to `herdr pane run` only after another shell-readiness check.
 
 Pane ids are base36 per workspace (`w4:p1`, `wG:pA`, `wH:p1B`). Anything that parses them must accept
 letters, not just digits.

@@ -1,6 +1,7 @@
 {
   "name": "pi-team-panes",
   "version": "0.1.0",
+  "type": "module",
   "description": "Split-pane workers for pi-agent-teams: herdr panes when pi runs inside herdr, iTerm2 panes via it2 otherwise.",
   "keywords": [
     "pi-package",
@@ -32,7 +33,7 @@
     "typescript": "^7.0.2"
   },
   "scripts": {
-    "test": "node --test test/panes-core.test.ts",
+    "test": "node --experimental-test-module-mocks --test test/*.test.ts",
     "typecheck": "node node_modules/typescript/lib/tsc.js --noEmit"
   }
 }

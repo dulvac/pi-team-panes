@@ -255,8 +255,10 @@ test("column geometry comes from the live layout, and unclean columns are skippe
     { paneId: "wG:p2", height: 34 },
     { paneId: "wG:p3", height: 33 },
   ]);
-  // An untracked pane sharing the column still counts, or the resize math lies.
-  assert.equal(columnFromLayout(clean, ["wG:p2"])?.length, 2);
+  // An untracked pane sharing the column: rects show where panes sit, not how the
+  // split tree nests, so we cannot prove the chain the resize amounts assume.
+  // Refuse the column and let the caller fall back to its modelled shares.
+  assert.equal(columnFromLayout(clean, ["wG:p2"]), null);
   // Tracked panes in different columns, or a gap in the stack: don't touch it.
   assert.equal(columnFromLayout(clean, ["wG:p1", "wG:p2"]), null);
   assert.equal(columnFromLayout(clean, ["wG:pZ"]), null);
@@ -268,6 +270,21 @@ test("column geometry comes from the live layout, and unclean columns are skippe
   );
   assert.equal(columnFromLayout(gapped, ["wG:p2", "wG:p3"]), null);
   assert.deepEqual(parseHerdrLayout("not json"), []);
+});
+
+test("a malformed pane entry is skipped, not fatal to the whole layout", () => {
+  // herdr is another process: a null hole or a half-filled entry must cost that
+  // one pane, not the measurement of the panes around it.
+  const panes = [
+    null,
+    { pane_id: "wG:p2", rect: { x: 176, y: 1, width: 140, height: 34 } },
+    "junk",
+    { pane_id: "wG:p3" },
+    { rect: { x: 176, y: 35, width: 140, height: 33 } },
+  ];
+  assert.deepEqual(parseHerdrLayout(JSON.stringify({ result: { layout: { panes } } })), [
+    { paneId: "wG:p2", rect: { x: 176, y: 1, width: 140, height: 34 } },
+  ]);
 });
 
 test("layout: first worker splits right, later workers stack down", () => {
@@ -352,7 +369,6 @@ test("agent start args carry kind, pane and timeout", () => {
 
 test("only pre-launch failures may fall back to a raw pane run", () => {
   for (const stderr of [
-    '{"error":{"code":"agent_pane_busy"}}',
     '{"error":{"code":"agent_pane_not_found"}}',
     '{"error":{"code":"agent_name_taken"}}',
     "unsupported interactive agent kind: pi",
@@ -360,7 +376,10 @@ test("only pre-launch failures may fall back to a raw pane run", () => {
     assert.equal(isPreLaunchFailure(stderr), true, stderr);
   }
   // A timeout means pi may already be booting in that pane: never retype into it.
+  // A busy pane is the same hazard: something already owns the foreground (a
+  // racing start, a leftover process), so a raw run would type into that program.
   for (const stderr of [
+    '{"error":{"code":"agent_pane_busy"}}',
     '{"error":{"code":"agent_launch_pending"}}',
     '{"error":{"code":"agent_not_ready"}}',
     "timed out waiting for interactive readiness",
@@ -399,8 +418,32 @@ test("shell readiness: only a pane whose foreground is just its shell is startab
   assert.equal(isShellAtPrompt(JSON.stringify({ result: {} })), false);
 });
 
+test("shell readiness is proven by the foreground list, never assumed", () => {
+  // Now that a busy pane no longer earns a raw-run fallback, a readiness claim we
+  // cannot back up costs the worker its agent registration. A payload without a
+  // usable foreground list says nothing about what the pane is running, so it is
+  // not-ready until the next poll says otherwise.
+  const info = (process_info: unknown) => JSON.stringify({ result: { process_info } });
+  assert.equal(isShellAtPrompt(info({ shell_pid: 100 })), false);
+  assert.equal(isShellAtPrompt(info({ shell_pid: 100, foreground_processes: null })), false);
+  assert.equal(isShellAtPrompt(info({ shell_pid: 100, foreground_processes: "zsh" })), false);
+  // An explicit empty list is a statement about the pane, and still means ready.
+  assert.equal(isShellAtPrompt(info({ shell_pid: 100, foreground_processes: [] })), true);
+});
+
 test("worker names are sanitized", () => {
   assert.equal(sanitizeName(" Sage "), "sage");
   assert.equal(sanitizeName("A_b-1"), "a_b-1");
   assert.throws(() => sanitizeName("***"), /Invalid worker name/);
+});
+
+test("a name that would read as a CLI flag is rejected", () => {
+  // Every name reaches a command line (`herdr agent start <name> ...`), so a
+  // leading hyphen would be parsed as an option by the backend instead of a
+  // worker name.
+  for (const raw of ["--help", "-f", " --all ", "--pane", "-"]) {
+    assert.throws(() => sanitizeName(raw), /Invalid worker name/, raw);
+  }
+  // Hyphens anywhere else stay legal.
+  assert.equal(sanitizeName("core-fixes"), "core-fixes");
 });

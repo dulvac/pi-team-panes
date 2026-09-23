@@ -33,8 +33,8 @@ import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { resolveTeams, type TeamsAdapter } from "./teams-adapter.ts";
 import * as path from "node:path";
-import * as fs from "node:fs";
 
 import {
   type BackendKind,
@@ -71,7 +71,22 @@ const execFileP = promisify(execFile);
  * modelled height share (fraction of the column) used when the backend cannot
  * report real geometry.
  */
-const panes = new Map<string, { paneId: string; backend: BackendKind; share: number }>();
+const panes = new Map<string, { paneId: string; backend: BackendKind; share: number; teamId: string; taskListId: string }>();
+
+function assertWorkerNamespaces(team: TeamsAdapter): void {
+  for (const [name, worker] of panes) {
+    if (worker.teamId !== team.teamId || worker.taskListId !== team.taskListId) {
+      throw new Error(`Worker "${name}" uses another team/task list. Close and respawn it before delegation.`);
+    }
+  }
+}
+
+let mutationTail: Promise<unknown> = Promise.resolve();
+function withPaneMutation<T>(operation: () => Promise<T>): Promise<T> {
+  const next = mutationTail.then(operation);
+  mutationTail = next.catch(() => {});
+  return next;
+}
 
 const CLI: Record<BackendKind, string> = { herdr: "herdr", it2: "it2" };
 const INSTALL_HINT: Record<BackendKind, string> = {
@@ -86,7 +101,9 @@ async function run(kind: BackendKind, args: string[]): Promise<string> {
   } catch (err: any) {
     if (err?.code === "ENOENT") throw new Error(INSTALL_HINT[kind]);
     const detail = (err?.stderr || err?.message || "").trim();
-    throw new Error(`${CLI[kind]} ${args.slice(0, 2).join(" ")} failed: ${detail}`);
+    let code: string | undefined;
+    try { code = JSON.parse(err?.stderr ?? "").error?.code; } catch { /* non-JSON CLI error */ }
+    throw Object.assign(new Error(`${CLI[kind]} ${args.slice(0, 2).join(" ")} failed: ${detail}`), { code });
   }
 }
 
@@ -125,41 +142,17 @@ function teamsRootDir(): string {
 }
 
 /** Same env a `/team env <name>` manual worker gets. */
-function workerEnv(name: string, teamId: string): Record<string, string> {
+function workerEnv(name: string, team: TeamsAdapter): Record<string, string> {
   return {
     PI_TEAMS_ROOT_DIR: teamsRootDir(),
     PI_TEAMS_WORKER: "1",
-    PI_TEAMS_TEAM_ID: teamId,
-    PI_TEAMS_TASK_LIST_ID: process.env.PI_TEAMS_TASK_LIST_ID ?? teamId,
+    PI_TEAMS_TEAM_ID: team.teamId,
+    PI_TEAMS_TASK_LIST_ID: team.taskListId,
     PI_TEAMS_AGENT_NAME: name,
-    PI_TEAMS_LEAD_NAME: process.env.PI_TEAMS_LEAD_NAME ?? "team-lead",
-    PI_TEAMS_STYLE: process.env.PI_TEAMS_STYLE ?? "normal",
+    PI_TEAMS_LEAD_NAME: team.leadName,
+    PI_TEAMS_STYLE: team.style,
     PI_TEAMS_AUTO_CLAIM: (process.env.PI_TEAMS_DEFAULT_AUTO_CLAIM ?? "1") === "1" ? "1" : "0",
   };
-}
-
-/**
- * Reuse the installed pi-agent-teams task-store so tasks created here land in the
- * same shared list the workers poll and the teams widget renders.
- */
-async function loadTaskStore(): Promise<{
-  createTask: (
-    teamDir: string,
-    taskListId: string,
-    input: { subject: string; description: string; owner?: string },
-  ) => Promise<{ id: string; subject: string }>;
-}> {
-  const base = path.join(
-    getAgentDir(),
-    "npm", "node_modules", "@tmustier", "pi-agent-teams",
-    "extensions", "teams", "task-store.ts",
-  );
-  if (!fs.existsSync(base)) {
-    throw new Error(
-      `pi-agent-teams task-store not found at ${base} — is the pi-agent-teams package installed?`,
-    );
-  }
-  return await import(base);
 }
 
 function startTimeoutMs(): number {
@@ -259,7 +252,9 @@ async function waitForShellPrompt(pane: string, timeoutMs = 10_000): Promise<boo
 
 /** Start pi as a named herdr agent, retrying once if the pane is still settling. */
 async function startHerdrAgent(name: string, pane: string): Promise<void> {
-  await waitForShellPrompt(pane);
+  if (!(await waitForShellPrompt(pane))) {
+    throw new Error("agent_pane_busy: shell readiness was not confirmed");
+  }
   const args = herdrAgentStartArgs({ name, pane, timeoutMs: startTimeoutMs() });
   try {
     await run("herdr", args);
@@ -272,7 +267,7 @@ async function startHerdrAgent(name: string, pane: string): Promise<void> {
 
 async function spawnPaneWorker(
   name: string,
-  teamId: string,
+  team: TeamsAdapter,
   cwd: string,
   remaining = 1,
 ): Promise<{ paneId: string; note?: string }> {
@@ -284,19 +279,19 @@ async function spawnPaneWorker(
   const column = await workerColumn(backend, leader);
   const plan = splitPlan({ leader, column, remaining, withRatio: backend === "herdr" });
   const share = trackShare(plan.source, plan.ratio ?? 0.5, column.length === 0);
-  const env = workerEnv(name, teamId);
+  const env = workerEnv(name, team);
 
   if (backend === "it2") {
     const paneId = parseIt2PaneId(await run("it2", it2SplitArgs(plan)));
+    panes.set(name, { paneId, backend, share, teamId: team.teamId, taskListId: team.taskListId });
     await run("it2", it2RunArgs(paneId, workerCommand({ cwd, env })));
-    panes.set(name, { paneId, backend, share });
     return { paneId };
   }
 
   // herdr: inject the worker env at pane creation, then let herdr launch and
   // name the agent so its lifecycle state shows up in the sidebar and CLI.
   const paneId = parseHerdrPaneId(await run("herdr", herdrSplitArgs({ plan, cwd, env })));
-  panes.set(name, { paneId, backend, share });
+  panes.set(name, { paneId, backend, share, teamId: team.teamId, taskListId: team.taskListId });
   // Size the column before pi boots, so the worker starts at its final size.
   await equalizeColumn(backend, leader);
   try {
@@ -312,6 +307,9 @@ async function spawnPaneWorker(
           "check it directly if the worker does not appear.",
       };
     }
+    if (!(await waitForShellPrompt(paneId))) {
+      return { paneId, note: `Worker "${name}" was not started: pane is not at a confirmed shell prompt (${detail}).` };
+    }
     await run("herdr", herdrRunArgs(paneId, workerCommand({ cwd, env })));
     return { paneId, note: `started "${name}" without herdr agent registration (${detail})` };
   }
@@ -321,9 +319,11 @@ async function closePaneWorker(name: string): Promise<void> {
   const entry = panes.get(name);
   if (!entry) throw new Error(`No pane tracked for "${name}"`);
   const args = entry.backend === "herdr" ? herdrCloseArgs(entry.paneId) : it2CloseArgs(entry.paneId);
-  await run(entry.backend, args).catch(() => {
-    /* pane may already be closed by hand */
-  });
+  try {
+    await run(entry.backend, args);
+  } catch (error: any) {
+    if (entry.backend !== "herdr" || error?.code !== "pane_not_found") throw error;
+  }
   panes.delete(name);
   // The closed pane's rows go to one neighbour; hand them round instead.
   await equalizeColumn(entry.backend, leaderPane(entry.backend, process.env));
@@ -368,6 +368,8 @@ const PANE_WORKERS_PARAMS = Type.Object({
 });
 
 export default function (pi: ExtensionAPI) {
+  // Pane lifecycle belongs to the leader; workers use their existing team mailbox.
+  if (process.env.PI_TEAMS_WORKER === "1") return;
   // ---- Pane-first default: inject policy so the model prefers panes ---------
   pi.on("before_agent_start", async (event, _ctx) => {
     if (!paneFirstConfigured()) return;
@@ -380,7 +382,7 @@ export default function (pi: ExtensionAPI) {
   // ---- /panes command ------------------------------------------------------
   pi.registerCommand("panes", {
     description: "Spawn/close pi-agent-teams workers in split panes (herdr or iTerm2)",
-    handler: async (args, ctx) => {
+    handler: async (args, ctx) => withPaneMutation(async () => {
       const argv = (args ?? "").trim().split(/\s+/).filter(Boolean);
       const rest = argv.filter((a) => a !== "-v"); // -v accepted but ignored (auto layout)
       const sub = rest[0];
@@ -410,14 +412,16 @@ export default function (pi: ExtensionAPI) {
           return;
         }
 
-        const teamId = process.env.PI_TEAMS_TEAM_ID ?? ctx.sessionManager.getSessionId();
+        const team = await resolveTeams(pi, teamsRootDir());
+        assertWorkerNamespaces(team);
+        const teamId = team.teamId;
         const spawned: string[] = [];
         const notes: string[] = [];
         const wanted = rest.map(sanitizeName);
         for (const [index, name] of wanted.entries()) {
           const { paneId, note } = await spawnPaneWorker(
             name,
-            teamId,
+            team,
             ctx.cwd,
             wanted.length - index,
           );
@@ -435,7 +439,7 @@ export default function (pi: ExtensionAPI) {
       } catch (err: any) {
         ctx.ui.notify(err?.message ?? String(err), "error");
       }
-    },
+    }),
   });
 
   // ---- LLM-callable tool ---------------------------------------------------
@@ -452,88 +456,74 @@ export default function (pi: ExtensionAPI) {
       "leader left, members stacked in an evenly sized right-hand column.",
     parameters: PANE_WORKERS_PARAMS,
     async execute(_id, params, _signal, _onUpdate, ctx) {
-      const { action, names = [], tasks = [] } = params;
+      return withPaneMutation(async () => {
+        const { action, names = [], tasks = [] } = params;
+        if ((action === "spawn" || action === "close") && names.length === 0) {
+          throw new Error(`"names" is required for action=${action}`);
+        }
+        const preparedTasks = tasks.map((task) => ({
+          text: task.text.trim(),
+          owner: task.assignee ? sanitizeName(task.assignee) : undefined,
+        })).filter((task) => task.text);
+        if (action === "delegate" && preparedTasks.length === 0) {
+          throw new Error('Non-empty "tasks" is required for action=delegate');
+        }
 
-      if (action === "list") {
-        return { content: [{ type: "text", text: listText() }], details: {} };
-      }
+        if (action === "list") {
+          return { content: [{ type: "text", text: listText() }], details: {} };
+        }
 
-      if (action === "close") {
-        if (names.length === 0) {
+        if (action === "close") {
+          for (const raw of names) await closePaneWorker(sanitizeName(raw));
           return {
-            content: [{ type: "text", text: '"names" is required for action=close' }],
-            isError: true,
+            content: [{ type: "text", text: `Closed pane(s): ${names.join(", ")}` }],
             details: {},
           };
         }
-        for (const raw of names) await closePaneWorker(sanitizeName(raw));
-        return {
-          content: [{ type: "text", text: `Closed pane(s): ${names.join(", ")}` }],
-          details: {},
-        };
-      }
 
-      const teamId = process.env.PI_TEAMS_TEAM_ID ?? ctx.sessionManager.getSessionId();
-      const lines: string[] = [];
+        const team = await resolveTeams(pi, teamsRootDir());
+        assertWorkerNamespaces(team);
+        const teamId = team.teamId;
+        const lines: string[] = [];
 
-      if (action === "spawn" && names.length === 0) {
-        return {
-          content: [{ type: "text", text: '"names" is required for action=spawn' }],
-          isError: true,
-          details: {},
-        };
-      }
-      const wanted = names
-        .map(sanitizeName)
-        .filter((name) => !(action === "delegate" && panes.has(name)));
-      for (const [index, name] of wanted.entries()) {
-        const { paneId, note } = await spawnPaneWorker(
-          name,
-          teamId,
-          ctx.cwd,
-          wanted.length - index,
-        );
-        lines.push(`Spawned "${name}" in pane ${paneId} (team ${teamId}).`);
-        if (note) lines.push(note);
-      }
-
-      if (action === "delegate") {
-        if (tasks.length === 0) {
-          return {
-            content: [{ type: "text", text: '"tasks" is required for action=delegate' }],
-            isError: true,
-            details: {},
-          };
+        const requested = [...new Set(names.map(sanitizeName))];
+        const wanted = requested.filter((name) => !(action === "delegate" && panes.has(name)));
+        for (const [index, name] of wanted.entries()) {
+          const { paneId, note } = await spawnPaneWorker(
+            name,
+            team,
+            ctx.cwd,
+            wanted.length - index,
+          );
+          lines.push(`Spawned "${name}" in pane ${paneId} (team ${teamId}).`);
+          if (note) lines.push(note);
         }
-        const { createTask } = await loadTaskStore();
-        const teamDir = path.join(teamsRootDir(), teamId);
-        const taskListId = process.env.PI_TEAMS_TASK_LIST_ID ?? teamId;
-        for (const task of tasks) {
-          const text = task.text.trim();
-          if (!text) continue;
-          const subject = (text.split("\n")[0] ?? "").slice(0, 120);
-          const owner = task.assignee ? sanitizeName(task.assignee) : undefined;
-          const created = await createTask(teamDir, taskListId, {
-            subject,
-            description: text,
-            owner,
-          });
+
+        if (action === "delegate") {
+          for (const { text, owner } of preparedTasks) {
+            const subject = (text.split("\n")[0] ?? "").slice(0, 120);
+            const created = await team.createTask({
+              subject,
+              description: text,
+              owner,
+            });
+            lines.push(
+              `Created task #${created.id}: ${subject}${owner ? ` → ${owner}` : " (unassigned)"}`,
+            );
+          }
           lines.push(
-            `Created task #${created.id}: ${subject}${owner ? ` → ${owner}` : " (unassigned)"}`,
+            "Pane workers poll the shared task list and auto-claim unassigned, unblocked tasks once " +
+              "their pi session is up (a few seconds). Monitor via the teams tool (member_status) or /tw.",
+          );
+        } else {
+          lines.push(
+            "Workers appear in the team widget once their pi session starts (a few seconds). " +
+              "They auto-claim unassigned tasks; use the teams tool to assign tasks or send messages.",
           );
         }
-        lines.push(
-          "Pane workers poll the shared task list and auto-claim unassigned, unblocked tasks once " +
-            "their pi session is up (a few seconds). Monitor via the teams tool (member_status) or /tw.",
-        );
-      } else {
-        lines.push(
-          "Workers appear in the team widget once their pi session starts (a few seconds). " +
-            "They auto-claim unassigned tasks; use the teams tool to assign tasks or send messages.",
-        );
-      }
 
-      return { content: [{ type: "text", text: lines.join("\n") }], details: {} };
+        return { content: [{ type: "text", text: lines.join("\n") }], details: {} };
+      });
     },
   });
 }
