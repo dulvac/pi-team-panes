@@ -10,6 +10,7 @@ import {
   evenSplitRatio,
   herdrAgentStartArgs,
   herdrResizeArgs,
+  herdrSnapshotArgs,
   herdrSplitArgs,
   isPreLaunchFailure,
   isShellAtPrompt,
@@ -17,6 +18,7 @@ import {
   leaderPane,
   paneFirstPolicy,
   parseHerdrLayout,
+  parseHerdrPaneStatuses,
   parseHerdrPaneId,
   parseIt2PaneId,
   pickBackend,
@@ -446,4 +448,55 @@ test("a name that would read as a CLI flag is rejected", () => {
   }
   // Hyphens anywhere else stay legal.
   assert.equal(sanitizeName("core-fixes"), "core-fixes");
+});
+
+// ── herdr snapshot: the pane backend's own view of each agent ───────────────
+
+test("herdrSnapshotArgs asks herdr for its api snapshot", () => {
+  assert.deepEqual(herdrSnapshotArgs(), ["api", "snapshot"]);
+});
+
+test("parseHerdrPaneStatuses reads agent_status per pane from a real snapshot shape", () => {
+  const snapshot = JSON.stringify({
+    id: 1,
+    result: {
+      type: "snapshot",
+      snapshot: {
+        panes: [
+          { pane_id: "w4:pC", agent: "pi", agent_status: "working", cwd: "/x" },
+          { pane_id: "w4:pN", agent: "pi", agent_status: "idle", cwd: "/x" },
+          { pane_id: "w4:pD", agent: "pi", agent_status: "done", cwd: "/x" },
+          { pane_id: "w4:pE", agent: null, agent_status: "unknown", cwd: "/x" },
+        ],
+      },
+    },
+  });
+
+  const statuses = parseHerdrPaneStatuses(snapshot);
+
+  assert.equal(statuses.get("w4:pC"), "working");
+  assert.equal(statuses.get("w4:pN"), "idle");
+  assert.equal(statuses.get("w4:pD"), "done");
+  assert.equal(statuses.get("w4:pE"), "unknown");
+  assert.equal(statuses.size, 4);
+});
+
+test("parseHerdrPaneStatuses tolerates panes keyed by object instead of array", () => {
+  const snapshot = JSON.stringify({
+    result: { snapshot: { panes: { a: { pane_id: "w1:p1", agent_status: "working" } } } },
+  });
+
+  assert.equal(parseHerdrPaneStatuses(snapshot).get("w1:p1"), "working");
+});
+
+test("parseHerdrPaneStatuses returns empty on junk, a missing snapshot, or odd entries", () => {
+  assert.equal(parseHerdrPaneStatuses("not json").size, 0);
+  assert.equal(parseHerdrPaneStatuses("{}").size, 0);
+  assert.equal(parseHerdrPaneStatuses(JSON.stringify({ result: { snapshot: {} } })).size, 0);
+  assert.equal(
+    parseHerdrPaneStatuses(
+      JSON.stringify({ result: { snapshot: { panes: [null, 7, { pane_id: 5 }, { agent_status: "working" }] } } }),
+    ).size,
+    0,
+  );
 });

@@ -114,6 +114,48 @@ planners through a model of herdr's split and resize behaviour, measured against
 regression in the sizing math fails in `npm test` rather than on screen. `src/index.ts` is the pi glue:
 command, tool, and the pane-first policy.
 
+## Worker activity in the teams widget
+
+pi-agent-teams derives the widget's status and counters from a `TeammateRpc` handle, which exists only
+for teammates its leader spawned itself. A pane worker is an independent `pi` process that
+self-registers into the roster, so the leader holds no handle for it: `resolveDisplayStatus` falls
+through to a hardcoded `"idle"` and every counter reads zero, however busy the worker is. In a long
+run that means the widget and `member_status` both report `idle · 0 tool calls · 0 turns · 0 tokens`
+for workers that are editing files and committing.
+
+This package closes that gap without a second widget. Each roster member records its own transcript
+path, and a pi transcript carries everything the tracker consumes: assistant `usage.totalTokens`,
+`toolCall` blocks and their `toolResult` answers, and per-entry timestamps. `src/worker-activity.ts`
+folds appended bytes into counters, `src/index.ts` polls every 1.5s and publishes on the
+`teams:activity` event channel, and pi-agent-teams' leader feeds those numbers into the tracker it
+already has, so the existing widget, the interactive panel and `member_status` all show the truth.
+
+Status comes from herdr's own per-pane `agent_status` when the herdr backend is active, because herdr
+knows a worker is thinking during a long pause where the transcript is silent. Without that (the it2
+backend), status is inferred: an unanswered tool call means working, otherwise transcript recency
+decides, and a worker whose transcript is still empty reads as `starting` rather than `idle`.
+
+The consumer half is five small edits to pi-agent-teams (verified against a pristine `0.5.5` tarball),
+open upstream as [tmustier/pi-agent-teams#49](https://github.com/tmustier/pi-agent-teams/pull/49) and
+kept here in `upstream/pi-agent-teams-activity.patch` until it lands:
+
+```bash
+cd ~/.pi/agent/npm/node_modules/@tmustier/pi-agent-teams
+patch -p1 < /path/to/pi-team-panes/upstream/pi-agent-teams-activity.patch
+```
+
+It adds `ActivityTracker.applyExternal`, an external-activity registry consulted by
+`resolveDisplayStatus` and `resolveStatus`, a `resolveLastEventAge` helper so `member_status` and
+`/team info` can report how long a pane worker has been quiet, and a
+`pi.events.on("teams:activity", ...)` subscription in the leader. A live RPC handle always wins over an
+external report, an offline member stays `stopped`, and a stale `streaming` report degrades to
+`stalled` on the existing threshold. Reapply the patch after updating pi-agent-teams; without it this
+package still works, the widget just keeps showing zeros.
+
+Measured on a live run: a pane worker went `starting` to `streaming` with its current tool named,
+counters climbing 5 to 8 tool calls and 225k to 403k tokens, back to `idle` between turns, then
+`stopped` with counters cleared when the pane closed.
+
 ## License
 
 MIT

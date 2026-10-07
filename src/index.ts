@@ -35,6 +35,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { resolveTeams, type TeamsAdapter } from "./teams-adapter.ts";
 import * as path from "node:path";
+import * as fs from "node:fs";
 
 import {
   type BackendKind,
@@ -47,6 +48,7 @@ import {
   herdrProcessInfoArgs,
   herdrResizeArgs,
   herdrRunArgs,
+  herdrSnapshotArgs,
   herdrSplitArgs,
   isPreLaunchFailure,
   isShellAtPrompt,
@@ -57,12 +59,21 @@ import {
   paneFirstPolicy,
   parseHerdrLayout,
   parseHerdrPaneId,
+  parseHerdrPaneStatuses,
   parseIt2PaneId,
   pickBackend,
   sanitizeName,
   splitPlan,
   workerCommand,
 } from "./panes-core.ts";
+import {
+  activityPayload,
+  consumeSlice,
+  deriveStatus,
+  emptyCounters,
+  type ActivityCounters,
+  type ActivityPayload,
+} from "./worker-activity.ts";
 
 const execFileP = promisify(execFile);
 
@@ -86,6 +97,155 @@ function withPaneMutation<T>(operation: () => Promise<T>): Promise<T> {
   const next = mutationTail.then(operation);
   mutationTail = next.catch(() => {});
   return next;
+}
+
+// ---- Pane-worker activity -------------------------------------------------
+// pi-agent-teams derives the widget's status and counters from a TeammateRpc
+// handle, which exists only for teammates its leader spawned itself. A pane
+// worker is an independent pi process, so there is no handle,
+// resolveDisplayStatus falls through to a hardcoded "idle", and every counter
+// reads zero however busy the worker is. Each worker's transcript holds the same
+// facts, so we read those and publish them on pi.events for the widget.
+
+const ACTIVITY_CHANNEL = "teams:activity";
+const ACTIVITY_POLL_MS = 1_500;
+const PANE_STATUS_TTL_MS = 5_000;
+
+interface RosterMember {
+  name: string;
+  status?: string;
+  sessionFile?: string;
+}
+
+const activity = new Map<string, ActivityCounters>();
+const publishedActivity = new Map<string, string>();
+let activityTimer: ReturnType<typeof setInterval> | null = null;
+let activityTeamId: string | null = null;
+let bus: { emit(channel: string, data: unknown): void } | null = null;
+let paneStatusAt = 0;
+let paneStatusCache = new Map<string, string>();
+
+/** Members as the roster file has them; we need sessionFile and status. */
+function rosterMembers(teamId: string): Map<string, RosterMember> {
+  const found = new Map<string, RosterMember>();
+  try {
+    const raw = fs.readFileSync(path.join(teamsRootDir(), teamId, "config.json"), "utf8");
+    const parsed = JSON.parse(raw) as { members?: unknown };
+    if (!Array.isArray(parsed.members)) return found;
+    for (const member of parsed.members) {
+      if (typeof member !== "object" || member === null) continue;
+      const { name } = member as RosterMember;
+      if (typeof name === "string") found.set(name, member as RosterMember);
+    }
+  } catch {
+    // No roster yet, or a write in flight: the next poll picks it up.
+  }
+  return found;
+}
+
+/** herdr's own per-pane agent state, cached because each call spawns a CLI. */
+async function livePaneStatuses(backend: BackendKind): Promise<Map<string, string>> {
+  if (backend !== "herdr") return new Map();
+  const now = Date.now();
+  if (now - paneStatusAt < PANE_STATUS_TTL_MS) return paneStatusCache;
+  paneStatusAt = now;
+  try {
+    paneStatusCache = parseHerdrPaneStatuses(await run("herdr", herdrSnapshotArgs()));
+  } catch {
+    paneStatusCache = new Map();
+  }
+  return paneStatusCache;
+}
+
+/**
+ * Read whatever was appended past `offset`.
+ *
+ * A shrunken file means the transcript was rotated or replaced, so the caller
+ * starts over rather than reading from a stale offset. A tail ending
+ * mid-character is harmless: only whole lines are consumed, so those bytes get
+ * re-read from their real start on the next poll.
+ */
+function readAppended(file: string, offset: number): { text: string; reset: boolean } {
+  let size: number;
+  try {
+    size = fs.statSync(file).size;
+  } catch {
+    return { text: "", reset: false };
+  }
+  if (size < offset) return { text: "", reset: true };
+  if (size === offset) return { text: "", reset: false };
+  const fd = fs.openSync(file, "r");
+  try {
+    const buf = Buffer.allocUnsafe(size - offset);
+    const read = fs.readSync(fd, buf, 0, buf.length, offset);
+    return { text: buf.subarray(0, read).toString("utf8"), reset: false };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/** Publish only on change, so an idle team does not emit twice a second. */
+function publishActivity(payload: ActivityPayload): void {
+  const encoded = JSON.stringify(payload);
+  if (publishedActivity.get(payload.name) === encoded) return;
+  publishedActivity.set(payload.name, encoded);
+  bus?.emit(ACTIVITY_CHANNEL, payload);
+}
+
+async function pollActivity(): Promise<void> {
+  if (!bus || !activityTeamId) return;
+  if (panes.size === 0) {
+    stopActivityPoller();
+    return;
+  }
+  const members = rosterMembers(activityTeamId);
+  const now = Date.now();
+  for (const [name, entry] of panes) {
+    const member = members.get(name);
+    const statuses = await livePaneStatuses(entry.backend);
+    let counters = activity.get(name) ?? emptyCounters();
+    if (member?.sessionFile) {
+      const { text, reset } = readAppended(member.sessionFile, counters.offset);
+      if (reset) counters = emptyCounters();
+      else if (text) counters = consumeSlice(counters, text);
+    }
+    activity.set(name, counters);
+    publishActivity(
+      activityPayload(
+        name,
+        deriveStatus({
+          memberOnline: member?.status === "online",
+          paneStatus: statuses.get(entry.paneId),
+          counters,
+          now,
+        }),
+        counters,
+      ),
+    );
+  }
+}
+
+function startActivityPoller(teamId: string): void {
+  activityTeamId = teamId;
+  if (activityTimer) return;
+  activityTimer = setInterval(() => void pollActivity(), ACTIVITY_POLL_MS);
+  // Never keep a pi process alive just to report on panes.
+  activityTimer.unref?.();
+  void pollActivity();
+}
+
+function stopActivityPoller(): void {
+  if (!activityTimer) return;
+  clearInterval(activityTimer);
+  activityTimer = null;
+}
+
+/** A closed pane leaves no ghost row: say stopped once, then forget it. */
+function forgetActivity(name: string): void {
+  const counters = activity.get(name) ?? emptyCounters();
+  activity.delete(name);
+  publishedActivity.delete(name);
+  bus?.emit(ACTIVITY_CHANNEL, activityPayload(name, "stopped", counters));
 }
 
 const CLI: Record<BackendKind, string> = { herdr: "herdr", it2: "it2" };
@@ -285,6 +445,7 @@ async function spawnPaneWorker(
     const paneId = parseIt2PaneId(await run("it2", it2SplitArgs(plan)));
     panes.set(name, { paneId, backend, share, teamId: team.teamId, taskListId: team.taskListId });
     await run("it2", it2RunArgs(paneId, workerCommand({ cwd, env })));
+    startActivityPoller(team.teamId);
     return { paneId };
   }
 
@@ -292,6 +453,7 @@ async function spawnPaneWorker(
   // name the agent so its lifecycle state shows up in the sidebar and CLI.
   const paneId = parseHerdrPaneId(await run("herdr", herdrSplitArgs({ plan, cwd, env })));
   panes.set(name, { paneId, backend, share, teamId: team.teamId, taskListId: team.taskListId });
+  startActivityPoller(team.teamId);
   // Size the column before pi boots, so the worker starts at its final size.
   await equalizeColumn(backend, leader);
   try {
@@ -325,6 +487,8 @@ async function closePaneWorker(name: string): Promise<void> {
     if (entry.backend !== "herdr" || error?.code !== "pane_not_found") throw error;
   }
   panes.delete(name);
+  forgetActivity(name);
+  if (panes.size === 0) stopActivityPoller();
   // The closed pane's rows go to one neighbour; hand them round instead.
   await equalizeColumn(entry.backend, leaderPane(entry.backend, process.env));
 }
@@ -370,6 +534,10 @@ const PANE_WORKERS_PARAMS = Type.Object({
 export default function (pi: ExtensionAPI) {
   // Pane lifecycle belongs to the leader; workers use their existing team mailbox.
   if (process.env.PI_TEAMS_WORKER === "1") return;
+
+  // Channel for pane-worker activity, consumed by the teams widget.
+  bus = pi.events;
+
   // ---- Pane-first default: inject policy so the model prefers panes ---------
   pi.on("before_agent_start", async (event, _ctx) => {
     if (!paneFirstConfigured()) return;

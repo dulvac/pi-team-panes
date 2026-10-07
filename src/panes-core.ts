@@ -356,6 +356,39 @@ export function herdrCloseArgs(pane: string): string[] {
   return ["pane", "close", pane];
 }
 
+export function herdrSnapshotArgs(): string[] {
+  return ["api", "snapshot"];
+}
+
+/**
+ * Map pane id to herdr's own view of the agent running there (`working`,
+ * `idle`, `done`, `unknown`).
+ *
+ * herdr tracks this per pane for its sidebar and it stayed accurate through a
+ * run where the teams widget showed every worker as idle, so it is the better
+ * status source whenever the herdr backend is in use. A worker deep in a long
+ * thinking pause writes nothing to its transcript, and only herdr can tell
+ * that apart from a worker that has finished.
+ */
+export function parseHerdrPaneStatuses(snapshotStdout: string): Map<string, string> {
+  const statuses = new Map<string, string>();
+  let payload: unknown;
+  try {
+    payload = JSON.parse(snapshotStdout);
+  } catch {
+    return statuses;
+  }
+  const panes = (payload as { result?: { snapshot?: { panes?: unknown } } })?.result?.snapshot?.panes;
+  const list = Array.isArray(panes) ? panes : panes && typeof panes === "object" ? Object.values(panes) : [];
+  for (const entry of list) {
+    if (typeof entry !== "object" || entry === null) continue;
+    const { pane_id: paneId, agent_status: status } = entry as { pane_id?: unknown; agent_status?: unknown };
+    if (typeof paneId !== "string" || typeof status !== "string") continue;
+    statuses.set(paneId, status);
+  }
+  return statuses;
+}
+
 export function herdrRenameArgs(pane: string, title: string): string[] {
   return ["pane", "rename", pane, title];
 }
